@@ -987,20 +987,28 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
         }
 
         const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
-        for (int config = 0; config < (arch == LLM_ARCH_DORY ? 8 : 2); ++config) {
-            const bool moe = arch != LLM_ARCH_DORY && config != 0;
+        const int n_configs = arch == LLM_ARCH_DORY ? 8 : (arch == LLM_ARCH_QWEN35 ? 3 : 2);
+        for (int config = 0; config < n_configs; ++config) {
+            const bool moe = arch != LLM_ARCH_DORY && arch != LLM_ARCH_QWEN35 && config != 0;
             if (moe && !moe_implemented(arch)) {
                 continue;
             }
             if (!moe && moe_mandatory(arch)) {
                 continue;
             }
-            const std::string config_name = arch == LLM_ARCH_DORY ? "K" + std::to_string(config % 4 + 1) + (config < 4 ? "/P" : "/L") : moe ? "MoE" : "Dense";
+            const std::string config_name =
+                arch == LLM_ARCH_DORY   ? "K" + std::to_string(config % 4 + 1) + (config < 4 ? "/P" : "/L") :
+                arch == LLM_ARCH_QWEN35 ? (config == 0 ? "K1" : (config == 1 ? "K6/P" : "K6/L")) :
+                moe ? "MoE" : "Dense";
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe, stdev);
             if (arch == LLM_ARCH_DORY) {
                 llama_model_saver ms(arch, gguf_ctx.get());
                 ms.add_kv(LLM_KV_NUM_LOOPS, uint32_t(config % 4 + 1));
                 ms.add_kv(LLM_KV_RECURRENT_KV_CACHE_MODE, config < 4 ? "per_loop" : "last_loop");
+            } else if (arch == LLM_ARCH_QWEN35 && config > 0) {
+                llama_model_saver ms(arch, gguf_ctx.get());
+                ms.add_kv(LLM_KV_NUM_LOOPS, uint32_t(6));
+                ms.add_kv(LLM_KV_RECURRENT_KV_CACHE_MODE, config == 1 ? "per_loop" : "last_loop");
             }
             if (arch == LLM_ARCH_BAILINGMOE3) {
                 GGML_ASSERT(gguf_remove_key(gguf_ctx.get(), "bailingmoe3.kda.safe_gate") >= 0);
@@ -1058,7 +1066,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                             std::vector<float> logits_chunks;
                             if (llm_arch_supports_mixed_batch(arch)) {
                                 // Shared final-loop KV depends on chunk boundaries; compare the same mixed batch across backends.
-                                const bool shared_kv = arch == LLM_ARCH_DORY && config >= 4;
+                                const bool shared_kv = (arch == LLM_ARCH_DORY && config >= 4) || (arch == LLM_ARCH_QWEN35 && config == 2);
                                 llama_model * reference_model = shared_kv ? model_and_ctx_cpu.first.get() : model_and_ctx_dev.first.get();
                                 llama_context * reference_ctx = shared_kv ? model_and_ctx_cpu.second.get() : lctx_dev;
                                 if (get_logits_mixed(reference_model, reference_ctx, tokens, embd_mixed, shared_kv, logits_chunks) != 0 ||
@@ -1096,7 +1104,7 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                     FILE * file = tmpfile(); // Can be null on Windows without administrator privileges.
                     // FIXME: when adding a tensor to a gguf_context a copy is made, this changes the pointer which the meta backend
                     //     in turn uses to map the tensors to their simple equivalents - this is fundamentally incompatible
-                    if (file != nullptr && llama_model_saver_supports_arch(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR) {
+                    if (file != nullptr && llama_model_saver_supports_arch(arch) && dc.split_mode != LLAMA_SPLIT_MODE_TENSOR && !(arch == LLM_ARCH_QWEN35 && config > 0)) {
                         test_executed = true;
                         GGML_ASSERT(model_and_ctx_dev.first && model_and_ctx_dev.second);
                         llama_model_saver ms = llama_model_saver(model_and_ctx_dev.first.get());

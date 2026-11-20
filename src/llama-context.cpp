@@ -2420,10 +2420,15 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     } else if (model.arch == LLM_ARCH_HRM_TEXT) {
         // the 128-slot looped graph needs roughly one stack per token budget
         res = std::max<uint32_t>(n_tokens * 80, 64u * model.n_tensors());
+    } else if (model.arch == LLM_ARCH_QWEN35) {
+        // Looped Qwen3.5 may repeat the recurrent trunk up to 6+ times with per-loop LoRA and bridges.
+        res = std::max<uint32_t>({ n_tokens * 40u, 32u * (uint32_t) model.n_tensors(), 160u * model.hparams.n_layer() });
+        for (const auto & lora : model.loras) {
+            res += lora->get_n_nodes();
+        }
     } else if (model.arch == LLM_ARCH_QWEN3NEXT ||
         model.arch == LLM_ARCH_KIMI_LINEAR ||
         model.arch == LLM_ARCH_BAILINGMOE3 ||
-        model.arch == LLM_ARCH_QWEN35 ||
         model.arch == LLM_ARCH_QWEN35MOE ||
         model.arch == LLM_ARCH_CLEF ||
         model.arch == LLM_ARCH_QWEN4EXP ||

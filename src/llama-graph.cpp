@@ -1562,14 +1562,12 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         res = ggml_mul(ctx0, res, w_s);
     }
 
-    for (const auto & lora : *loras) {
-        llama_adapter_lora_weight * lw = lora.first->get_weight(w);
+    auto apply_lora_weight = [&](const llama_adapter_lora * adapter, float adapter_scale, const llama_adapter_lora_weight * lw) {
         if (lw == nullptr) {
-            continue;
+            return;
         }
 
-        const float adapter_scale = lora.second;
-        const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
+        const float scale = lw->get_scale(adapter->alpha, adapter_scale);
 
         ggml_tensor * ab_cur = ggml_mul_mat(
                 ctx0, lw->b,
@@ -1578,6 +1576,13 @@ ggml_tensor * llm_graph_context::build_lora_mm(
 
         ab_cur = ggml_scale(ctx0, ab_cur, scale);
         res = ggml_add(ctx0, res, ab_cur);
+    };
+
+    for (const auto & lora : *loras) {
+        apply_lora_weight(lora.first, lora.second, lora.first->get_weight(w));
+        if (cur_loop >= 0) {
+            apply_lora_weight(lora.first, lora.second, lora.first->get_loop_weight(w, cur_loop));
+        }
     }
 
     return res;
@@ -1822,7 +1827,8 @@ ggml_tensor * llm_graph_context::build_ffn(
             return false;
         }
         for (const auto & lora : *loras) {
-            if (lora.first->get_weight(w) != nullptr) {
+            if (lora.first->get_weight(w) != nullptr ||
+                (cur_loop >= 0 && lora.first->get_loop_weight(w, cur_loop) != nullptr)) {
                 return true;
             }
         }

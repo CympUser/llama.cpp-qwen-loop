@@ -60,11 +60,21 @@ struct llama_adapter_lora_weight {
     llama_adapter_lora_weight(ggml_tensor * a, ggml_tensor * b) : a(a), b(b) {}
 };
 
+struct llama_adapter_loop_bridge {
+    ggml_tensor * in_scale = nullptr;
+    ggml_tensor * embd     = nullptr;
+    ggml_tensor * out_gate = nullptr;
+};
+
 struct llama_adapter_lora {
     llama_model * model = nullptr;
 
     // map tensor name to lora_a_b
     std::unordered_map<std::string, llama_adapter_lora_weight> ab_map;
+
+    // per-loop specialized LoRA weights and loop boundary bridges
+    std::vector<std::unordered_map<std::string, llama_adapter_lora_weight>> loop_ab_maps;
+    std::vector<llama_adapter_loop_bridge> loop_bridges;
 
     std::vector<ggml_context_ptr> ctxs;
     std::vector<ggml_backend_buffer_ptr> bufs;
@@ -81,9 +91,16 @@ struct llama_adapter_lora {
     ~llama_adapter_lora() = default;
 
     llama_adapter_lora_weight * get_weight(ggml_tensor * w);
+    llama_adapter_lora_weight * get_loop_weight(ggml_tensor * w, int loop_idx);
+    const llama_adapter_loop_bridge * get_loop_bridge(int loop_idx) const;
 
     uint32_t get_n_nodes() const {
-        return ab_map.size() * 6u; // a, b, scale, add, 2 x mul_mat
+        uint32_t n = static_cast<uint32_t>(ab_map.size()) * 6u; // a, b, scale, add, 2 x mul_mat
+        for (const auto & loop_map : loop_ab_maps) {
+            n += static_cast<uint32_t>(loop_map.size()) * 6u;
+        }
+        n += static_cast<uint32_t>(loop_bridges.size()) * 12u;
+        return n;
     }
 };
 

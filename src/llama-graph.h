@@ -1055,6 +1055,9 @@ struct llm_graph_context {
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
 
+    // active loop index for looped architectures (-1 when outside loop or unlooped)
+    mutable int cur_loop = -1;
+
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
 

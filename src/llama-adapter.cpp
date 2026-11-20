@@ -148,6 +148,61 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
     return nullptr;
 }
 
+llama_adapter_lora_weight * llama_adapter_lora::get_loop_weight(ggml_tensor * w, int loop_idx) {
+    if (loop_idx < 0 || (size_t) loop_idx >= loop_ab_maps.size()) {
+        return nullptr;
+    }
+
+    const auto & m = loop_ab_maps[loop_idx];
+    const auto pos = m.find(std::string(w->name));
+    if (pos != m.end()) {
+        return const_cast<llama_adapter_lora_weight *>(&pos->second);
+    }
+
+    return nullptr;
+}
+
+const llama_adapter_loop_bridge * llama_adapter_lora::get_loop_bridge(int loop_idx) const {
+    if (loop_idx < 0 || (size_t) loop_idx >= loop_bridges.size()) {
+        return nullptr;
+    }
+
+    const auto & b = loop_bridges[loop_idx];
+    if (b.in_scale == nullptr && b.embd == nullptr && b.out_gate == nullptr) {
+        return nullptr;
+    }
+
+    return &b;
+}
+
+static bool parse_loop_prefix(const std::string & name, int & loop_idx, std::string & rest) {
+    constexpr const char * prefix = "loop.";
+    constexpr size_t prefix_len = 5;
+    if (name.compare(0, prefix_len, prefix) != 0) {
+        return false;
+    }
+
+    const size_t dot = name.find('.', prefix_len);
+    if (dot == std::string::npos || dot == prefix_len) {
+        return false;
+    }
+
+    int idx = 0;
+    for (size_t i = prefix_len; i < dot; ++i) {
+        if (name[i] < '0' || name[i] > '9') {
+            return false;
+        }
+        idx = idx * 10 + (name[i] - '0');
+        if (idx >= 16) {
+            return false;
+        }
+    }
+
+    loop_idx = idx;
+    rest = name.substr(dot + 1);
+    return !rest.empty();
+}
+
 static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama_adapter_lora & adapter) {
     ggml_context * ctx_init;
     gguf_init_params meta_gguf_params = {
@@ -265,14 +320,54 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
         return it->second;
     };
 
-    // bundle lora_a and lora_b into pairs
+    // bundle lora_a and lora_b into pairs (plus per-loop LoRA and loop bridges)
     std::map<std::string, llama_adapter_lora_weight> ab_map;
+    std::vector<std::map<std::string, llama_adapter_lora_weight>> loop_ab_orig;
+    std::vector<llama_adapter_loop_bridge> loop_bridge_orig;
     auto str_endswith = [](const std::string & str, const std::string & suffix) {
         return str.size() >= suffix.size() && str.compare(str.size()-suffix.size(), suffix.size(), suffix) == 0;
     };
 
     for (ggml_tensor * cur = ggml_get_first_tensor(ctx.get()); cur; cur = ggml_get_next_tensor(ctx.get(), cur)) {
         std::string name(cur->name);
+        int loop_idx = -1;
+        std::string rest;
+        if (parse_loop_prefix(name, loop_idx, rest)) {
+            if ((size_t) loop_idx >= loop_ab_orig.size()) {
+                loop_ab_orig.resize((size_t) loop_idx + 1);
+                loop_bridge_orig.resize((size_t) loop_idx + 1);
+            }
+            if (rest == "in_scale.weight" || rest == "embd.weight" || rest == "out_gate.weight") {
+                if (ggml_n_dims(cur) != 1 || cur->ne[0] != (int64_t) model.hparams.n_embd) {
+                    throw std::runtime_error("Loop bridge tensor '" + name + "' has invalid shape (expected 1D of n_embd)");
+                }
+                auto & bridge = loop_bridge_orig[loop_idx];
+                ggml_tensor ** slot =
+                    rest == "in_scale.weight" ? &bridge.in_scale :
+                    rest == "embd.weight"     ? &bridge.embd :
+                                                &bridge.out_gate;
+                if (*slot != nullptr) {
+                    throw std::runtime_error("Duplicate loop bridge tensor '" + name + "'");
+                }
+                *slot = cur;
+            } else if (str_endswith(rest, ".lora_a") || str_endswith(rest, ".lora_b")) {
+                const bool is_a = str_endswith(rest, ".lora_a");
+                std::string base_name = rest.substr(0, rest.size() - 7);
+                auto & m = loop_ab_orig[loop_idx];
+                if (m.find(base_name) == m.end()) {
+                    m[base_name] = is_a ? llama_adapter_lora_weight(cur, nullptr)
+                                        : llama_adapter_lora_weight(nullptr, cur);
+                } else if (is_a) {
+                    m[base_name].a = cur;
+                } else {
+                    m[base_name].b = cur;
+                }
+            } else {
+                throw std::runtime_error("Loop adapter tensor '" + name + "' has unexpected suffix");
+            }
+            continue;
+        }
+
         if (str_endswith(name, ".lora_a")) {
             replace_all(name, ".lora_a", "");
             if (ab_map.find(name) == ab_map.end()) {
@@ -319,10 +414,22 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
         }
     }
 
-    // add tensors
-    for (auto & it : ab_map) {
-        const std::string & name = it.first;
-        llama_adapter_lora_weight & w = it.second;
+    auto sanitize_buft = [&](ggml_backend_buffer_type_t buft, const char * tensor_desc) -> ggml_backend_buffer_type_t {
+        for (auto & ex : buft_extra) {
+            if (ex == buft) {
+                LLAMA_LOG_WARN("%s: lora for '%s' cannot use buft '%s', fallback to CPU\n", __func__, tensor_desc, ggml_backend_buft_name(buft));
+
+                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                if (!cpu_dev) {
+                    throw std::runtime_error(format("%s: no CPU backend found", __func__));
+                }
+                return ggml_backend_dev_buffer_type(cpu_dev);
+            }
+        }
+        return buft;
+    };
+
+    auto alloc_lora_pair = [&](const std::string & name, const llama_adapter_lora_weight & w) -> llama_adapter_lora_weight {
         bool is_token_embd = str_endswith(name, "token_embd.weight");
 
         if (!w.a || !w.b) {
@@ -335,22 +442,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
             throw std::runtime_error("LoRA tensor '" + name + "' does not exist in base model (hint: maybe wrong base model?)");
         }
 
-        auto * buft = ggml_backend_buffer_get_type(model_tensor->buffer);
-
-        // do not load loras to extra buffer types (i.e. bufts for repacking) -> use the CPU in that case
-        for (auto & ex : buft_extra) {
-            if (ex == buft) {
-                LLAMA_LOG_WARN("%s: lora for '%s' cannot use buft '%s', fallback to CPU\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
-
-                auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-                if (!cpu_dev) {
-                    throw std::runtime_error(format("%s: no CPU backend found", __func__));
-                }
-                buft = ggml_backend_dev_buffer_type(cpu_dev);
-
-                break;
-            }
-        }
+        auto * buft = sanitize_buft(ggml_backend_buffer_get_type(model_tensor->buffer), model_tensor->name);
 
         LLAMA_LOG_DEBUG("%s: lora for '%s' -> '%s'\n", __func__, model_tensor->name, ggml_backend_buft_name(buft));
 
@@ -375,7 +467,40 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
         ggml_tensor * tensor_b = ggml_dup_tensor(dev_ctx, w.b);
         ggml_set_name(tensor_a, w.a->name);
         ggml_set_name(tensor_b, w.b->name);
-        adapter.ab_map[name] = llama_adapter_lora_weight(tensor_a, tensor_b);
+        return llama_adapter_lora_weight(tensor_a, tensor_b);
+    };
+
+    // add standard LoRA tensors
+    for (auto & it : ab_map) {
+        adapter.ab_map[it.first] = alloc_lora_pair(it.first, it.second);
+    }
+
+    // add per-loop LoRA tensors
+    adapter.loop_ab_maps.resize(loop_ab_orig.size());
+    for (size_t k = 0; k < loop_ab_orig.size(); ++k) {
+        for (const auto & it : loop_ab_orig[k]) {
+            adapter.loop_ab_maps[k][it.first] = alloc_lora_pair(it.first, it.second);
+        }
+    }
+
+    // add loop bridge tensors
+    adapter.loop_bridges.resize(loop_bridge_orig.size());
+    if (!loop_bridge_orig.empty()) {
+        auto * bridge_buft = sanitize_buft(ggml_backend_dev_buffer_type(model.dev_layer(0)), "loop_bridge");
+        ggml_context * bridge_ctx = ctx_for_buft(bridge_buft);
+        auto dup_bridge_tensor = [&](ggml_tensor * orig) -> ggml_tensor * {
+            if (!orig) {
+                return nullptr;
+            }
+            ggml_tensor * t = ggml_dup_tensor(bridge_ctx, orig);
+            ggml_set_name(t, orig->name);
+            return t;
+        };
+        for (size_t k = 0; k < loop_bridge_orig.size(); ++k) {
+            adapter.loop_bridges[k].in_scale = dup_bridge_tensor(loop_bridge_orig[k].in_scale);
+            adapter.loop_bridges[k].embd     = dup_bridge_tensor(loop_bridge_orig[k].embd);
+            adapter.loop_bridges[k].out_gate = dup_bridge_tensor(loop_bridge_orig[k].out_gate);
+        }
     }
 
     // allocate tensors / buffers and zero
@@ -395,6 +520,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
     }
 
     // set tensor data
+    size_t n_loaded_tensors = 0;
     {
         std::vector<uint8_t> read_buf;
         auto set_tensor = [&](ggml_tensor * orig, ggml_tensor * dev) {
@@ -407,6 +533,7 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
             gguf_file.seek(offs, SEEK_SET);
             gguf_file.read_raw(read_buf.data(), size);
             ggml_backend_tensor_set(dev, read_buf.data(), 0, size);
+            ++n_loaded_tensors;
         };
         for (auto & it : adapter.ab_map) {
             auto orig = ab_map[it.first];
@@ -414,12 +541,27 @@ static void llama_adapter_lora_init_impl(llama_model & model, FILE * file, llama
             set_tensor(orig.a, dev.a);
             set_tensor(orig.b, dev.b);
         }
+        for (size_t k = 0; k < adapter.loop_ab_maps.size(); ++k) {
+            for (const auto & it : adapter.loop_ab_maps[k]) {
+                const auto & orig = loop_ab_orig[k].at(it.first);
+                const auto & dev  = it.second;
+                set_tensor(orig.a, dev.a);
+                set_tensor(orig.b, dev.b);
+            }
+        }
+        for (size_t k = 0; k < adapter.loop_bridges.size(); ++k) {
+            const auto & orig = loop_bridge_orig[k];
+            const auto & dev  = adapter.loop_bridges[k];
+            if (dev.in_scale) { set_tensor(orig.in_scale, dev.in_scale); }
+            if (dev.embd)     { set_tensor(orig.embd,     dev.embd);     }
+            if (dev.out_gate) { set_tensor(orig.out_gate, dev.out_gate); }
+        }
     }
 
     // register adapter with model
     model.loras.insert(&adapter);
 
-    LLAMA_LOG_INFO("%s: loaded %zu tensors from lora file\n", __func__, adapter.ab_map.size()*2);
+    LLAMA_LOG_INFO("%s: loaded %zu tensors from lora file\n", __func__, n_loaded_tensors);
 }
 
 llama_adapter_lora * llama_adapter_lora_init(llama_model * model, const char * path_lora) {

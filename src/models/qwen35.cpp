@@ -28,6 +28,132 @@ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
         case 64: type = LLM_TYPE_27B; break;
         default: type = LLM_TYPE_UNKNOWN;
     }
+
+    const uint32_t n_trunk_phys = hparams.n_layer();
+    const uint32_t n_nextn      = hparams.n_layer_nextn;
+    n_layer_phys = n_trunk_phys;
+
+    n_loops = 1;
+    ml.get_key(LLM_KV_NUM_LOOPS, n_loops, false);
+    if (n_loops == 0 || n_loops > 16) {
+        throw std::runtime_error("unsupported Qwen3.5 num_loops (expected 1..16)");
+    }
+
+    recurrent_kv_cache_mode = "per_loop";
+    ml.get_key(LLM_KV_RECURRENT_KV_CACHE_MODE, recurrent_kv_cache_mode, false);
+    if (recurrent_kv_cache_mode != "per_loop" && recurrent_kv_cache_mode != "last_loop") {
+        throw std::runtime_error("Qwen3.5 recurrent_kv_cache_mode must be per_loop or last_loop");
+    }
+
+    loop_residual_scale = 0.25f;
+    ml.get_key(LLM_KV_ALPHA_INIT, loop_residual_scale, false);
+    if (!std::isfinite(loop_residual_scale)) {
+        throw std::runtime_error("invalid Qwen3.5 alpha_init");
+    }
+
+    n_input     = 0;
+    n_recurrent = n_trunk_phys;
+    n_output    = 0;
+    physical.clear();
+    cache_layer.clear();
+    loop_index.clear();
+
+    if (n_loops > 1) {
+        const bool has_in  = ml.get_key(LLM_KV_INPUT_LAYER_COUNT,     n_input,     false);
+        const bool has_rec = ml.get_key(LLM_KV_RECURRENT_LAYER_COUNT, n_recurrent, false);
+        const bool has_out = ml.get_key(LLM_KV_OUTPUT_LAYER_COUNT,    n_output,    false);
+        if (!has_in && !has_rec && !has_out) {
+            if (n_trunk_phys >= 12 && (n_trunk_phys % 4 == 0)) {
+                n_input     = 4;
+                n_output    = 4;
+                n_recurrent = n_trunk_phys - 8;
+            } else if (n_trunk_phys >= 4) {
+                n_input     = 1;
+                n_output    = 1;
+                n_recurrent = n_trunk_phys - 2;
+            } else {
+                n_input     = 0;
+                n_output    = 0;
+                n_recurrent = n_trunk_phys;
+            }
+        } else if (!has_rec && n_input + n_output < n_trunk_phys) {
+            n_recurrent = n_trunk_phys - n_input - n_output;
+        }
+
+        if (n_recurrent == 0 || uint64_t(n_input) + n_recurrent + n_output != n_trunk_phys) {
+            throw std::runtime_error("invalid Qwen3.5 loop layer partition");
+        }
+
+        const uint64_t n_virtual = uint64_t(n_input) + uint64_t(n_recurrent) * n_loops + n_output;
+        if (n_virtual + n_nextn > LLAMA_MAX_LAYERS) {
+            throw std::runtime_error("Qwen3.5 looped virtual layer count exceeds LLAMA_MAX_LAYERS");
+        }
+
+        const uint32_t n_phys_all = n_trunk_phys + n_nextn;
+        std::vector<uint32_t> phys_n_head(n_phys_all);
+        std::vector<uint32_t> phys_n_head_kv(n_phys_all);
+        std::vector<uint32_t> phys_n_ff(n_phys_all);
+        std::vector<uint32_t> phys_is_swa(n_phys_all);
+        std::vector<uint32_t> phys_is_recr(n_phys_all);
+        std::vector<uint32_t> phys_rope_pattern(n_phys_all);
+        std::vector<float>    phys_swiglu_clamp_shexp(n_phys_all);
+        for (uint32_t p = 0; p < n_phys_all; ++p) {
+            phys_n_head[p]             = hparams.n_head_arr[p];
+            phys_n_head_kv[p]          = hparams.n_head_kv_arr[p];
+            phys_n_ff[p]               = hparams.n_ff_arr[p];
+            phys_is_swa[p]             = hparams.is_swa_impl[p];
+            phys_is_recr[p]            = hparams.is_recr_impl[p];
+            phys_rope_pattern[p]       = hparams.rope_pattern[p];
+            phys_swiglu_clamp_shexp[p] = hparams.swiglu_clamp_shexp[p];
+        }
+
+        const uint32_t n_virt_all = (uint32_t) (n_virtual + n_nextn);
+        physical.reserve(n_virt_all);
+        cache_layer.reserve(n_virt_all);
+        loop_index.reserve(n_virt_all);
+
+        for (uint32_t i = 0; i < n_input; ++i) {
+            const int il = (int) physical.size();
+            physical.push_back((int) i);
+            loop_index.push_back(-1);
+            cache_layer.push_back(il);
+        }
+        for (uint32_t k = 0; k < n_loops; ++k) {
+            for (uint32_t i = 0; i < n_recurrent; ++i) {
+                const int p  = (int) (n_input + i);
+                const int il = (int) physical.size();
+                physical.push_back(p);
+                loop_index.push_back((int) k);
+                cache_layer.push_back((recurrent_kv_cache_mode == "last_loop" && !phys_is_recr[p]) ? p : il);
+            }
+        }
+        for (uint32_t i = 0; i < n_output; ++i) {
+            const int p  = (int) (n_input + n_recurrent + i);
+            const int il = (int) physical.size();
+            physical.push_back(p);
+            loop_index.push_back(-1);
+            cache_layer.push_back(il);
+        }
+        for (uint32_t i = 0; i < n_nextn; ++i) {
+            const int p  = (int) (n_trunk_phys + i);
+            const int il = (int) physical.size();
+            physical.push_back(p);
+            loop_index.push_back(-1);
+            cache_layer.push_back(il);
+        }
+
+        hparams.n_layer_all = n_virt_all;
+        for (uint32_t il = 0; il < n_virt_all; ++il) {
+            const int p = physical[il];
+            hparams.n_head_arr[il]         = phys_n_head[p];
+            hparams.n_head_kv_arr[il]      = phys_n_head_kv[p];
+            hparams.n_ff_arr[il]           = phys_n_ff[p];
+            hparams.is_swa_impl[il]        = phys_is_swa[p];
+            hparams.is_recr_impl[il]       = phys_is_recr[p];
+            hparams.rope_pattern[il]       = phys_rope_pattern[p];
+            hparams.swiglu_clamp_shexp[il] = phys_swiglu_clamp_shexp[p];
+        }
+    }
 }
 
 void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
@@ -52,7 +178,7 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
-    auto load_block_trunk = [&](int il, int flags) {
+    auto load_block_trunk = [&](int il, int p, int flags) {
         auto & layer = layers[il];
 
         // Calculate dimensions from hyperparameters
@@ -64,66 +190,73 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         const int64_t value_dim  = head_v_dim * n_v_heads;
         const int64_t conv_dim   = key_dim * 2 + value_dim;
 
-        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", il), { n_embd }, flags);
-        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, flags);
+        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", p), { n_embd }, flags);
+        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", p), { n_embd }, flags);
 
         if (!hparams.is_recr(il)) {
             // Attention layers
-            create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
-            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", il), { n_embd_head_k * n_head, n_embd }, flags);
+            create_tensor_qkv(layer, p, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, flags);
+            layer.wo = create_tensor(tn(LLM_TENSOR_ATTN_OUT, "weight", p), { n_embd_head_k * n_head, n_embd }, flags);
 
             // Q/K normalization for attention layers
-            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, flags);
-            layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, flags);
+            layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", p), { n_embd_head_k }, flags);
+            layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", p), { n_embd_head_k }, flags);
         } else {
             // Linear attention (gated delta net) specific tensors
             // Create tensors with calculated dimensions
-            layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", il), { n_embd, key_dim * 2 + value_dim }, TENSOR_NOT_REQUIRED);
-            layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", il), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
-            layer.ssm_conv1d     = create_tensor(tn(LLM_TENSOR_SSM_CONV1D,     "weight", il), { hparams.ssm_d_conv, conv_dim }, flags);
-            layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   il), { hparams.ssm_dt_rank }, flags);
-            layer.ssm_a          = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,             il), { hparams.ssm_dt_rank }, flags);
-            layer.ssm_beta       = create_tensor(tn(LLM_TENSOR_SSM_BETA,       "weight", il), { n_embd, n_v_heads }, flags);
-            layer.ssm_alpha      = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,      "weight", il), { n_embd, n_v_heads }, flags);
-            layer.ssm_norm       = create_tensor(tn(LLM_TENSOR_SSM_NORM,       "weight", il), { head_v_dim }, flags);
-            layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", il), { value_dim, n_embd }, flags);
+            layer.wqkv           = create_tensor(tn(LLM_TENSOR_ATTN_QKV,       "weight", p), { n_embd, key_dim * 2 + value_dim }, TENSOR_NOT_REQUIRED);
+            layer.wqkv_gate      = create_tensor(tn(LLM_TENSOR_ATTN_GATE,      "weight", p), { n_embd, value_dim }, TENSOR_NOT_REQUIRED);
+            layer.ssm_conv1d     = create_tensor(tn(LLM_TENSOR_SSM_CONV1D,     "weight", p), { hparams.ssm_d_conv, conv_dim }, flags);
+            layer.ssm_dt         = create_tensor(tn(LLM_TENSOR_SSM_DT,         "bias",   p), { hparams.ssm_dt_rank }, flags);
+            layer.ssm_a          = create_tensor(tn(LLM_TENSOR_SSM_A_NOSCAN,             p), { hparams.ssm_dt_rank }, flags);
+            layer.ssm_beta       = create_tensor(tn(LLM_TENSOR_SSM_BETA,       "weight", p), { n_embd, n_v_heads }, flags);
+            layer.ssm_alpha      = create_tensor(tn(LLM_TENSOR_SSM_ALPHA,      "weight", p), { n_embd, n_v_heads }, flags);
+            layer.ssm_norm       = create_tensor(tn(LLM_TENSOR_SSM_NORM,       "weight", p), { head_v_dim }, flags);
+            layer.ssm_out        = create_tensor(tn(LLM_TENSOR_SSM_OUT,        "weight", p), { value_dim, n_embd }, flags);
         }
 
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, flags);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, flags);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, flags);
+        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", p), {n_embd,   n_ff}, flags);
+        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", p), {  n_ff, n_embd}, flags);
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", p), {n_embd,   n_ff}, flags);
     };
 
-    auto load_block_mtp = [&](int il) {
+    auto load_block_mtp = [&](int il, int p) {
         auto & layer = layers[il];
 
         // MTP block looks like a full-attention Qwen3.5 decoder block.
-        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", il), { n_embd }, mtp_flags);
-        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", il), { n_embd }, mtp_flags);
+        layer.attn_norm      = create_tensor(tn(LLM_TENSOR_ATTN_NORM,      "weight", p), { n_embd }, mtp_flags);
+        layer.attn_post_norm = create_tensor(tn(LLM_TENSOR_ATTN_POST_NORM, "weight", p), { n_embd }, mtp_flags);
 
-        create_tensor_qkv(layer, il, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, mtp_flags);
-        layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", il), { n_embd_head_k * n_head, n_embd }, mtp_flags);
-        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
-        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", il), { n_embd_head_k }, mtp_flags);
+        create_tensor_qkv(layer, p, n_embd, n_embd_head_k * n_head * 2, n_embd_k_gqa, n_embd_v_gqa, mtp_flags);
+        layer.wo          = create_tensor(tn(LLM_TENSOR_ATTN_OUT,    "weight", p), { n_embd_head_k * n_head, n_embd }, mtp_flags);
+        layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", p), { n_embd_head_k }, mtp_flags);
+        layer.attn_k_norm = create_tensor(tn(LLM_TENSOR_ATTN_K_NORM, "weight", p), { n_embd_head_k }, mtp_flags);
 
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", il), {n_embd,   n_ff}, mtp_flags);
-        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", il), {  n_ff, n_embd}, mtp_flags);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, mtp_flags);
+        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", p), {n_embd,   n_ff}, mtp_flags);
+        layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", p), {  n_ff, n_embd}, mtp_flags);
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", p), {n_embd,   n_ff}, mtp_flags);
 
         // NextN-specific tensors that define the MTP block.
-        layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", il), { 2 * n_embd, n_embd }, mtp_flags);
-        layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", il), { n_embd },              mtp_flags);
-        layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", il), { n_embd },              mtp_flags);
-        layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
-        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
-        layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
+        layer.nextn.eh_proj          = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,          "weight", p), { 2 * n_embd, n_embd }, mtp_flags);
+        layer.nextn.enorm            = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,            "weight", p), { n_embd },              mtp_flags);
+        layer.nextn.hnorm            = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,            "weight", p), { n_embd },              mtp_flags);
+        layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", p), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
+        layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", p), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
+        layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", p), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
     };
 
+    std::vector<int> first(n_layer_physical(), -1);
     for (int i = 0; i < n_layer; ++i) {
-        load_block_trunk(i, trunk_flags);
+        const int p = layer_physical(i);
+        if (first[p] >= 0) {
+            layers[i] = layers[first[p]];
+            continue;
+        }
+        first[p] = i;
+        load_block_trunk(i, p, trunk_flags);
     }
     for (int i = n_layer; i < n_layer_all; ++i) {
-        load_block_mtp(i);
+        load_block_mtp(i, layer_physical(i));
     }
 }
 
@@ -136,6 +269,7 @@ std::unique_ptr<llm_graph_context> llama_model_qwen35::build_arch_graph(const ll
 
 llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llm_build_delta_net_base(params), model(model) {
+    const auto & q35 = static_cast<const llama_model_qwen35 &>(model);
     const int64_t n_embd_head = hparams.n_embd_head_v();
 
     GGML_ASSERT(n_embd_head == hparams.n_embd_head_k());
@@ -155,8 +289,59 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
     ggml_tensor * inp_pos     = build_inp_pos();
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
+    const bool is_looped = q35.n_loops > 1 && !q35.loop_index.empty();
+    const auto f32 = [&](ggml_tensor * x) {
+        return x->type == GGML_TYPE_F32 ? x : ggml_cast(ctx0, x, GGML_TYPE_F32);
+    };
+    auto find_loop_bridge = [&](int loop_idx) -> std::pair<const llama_adapter_loop_bridge *, float> {
+        if (!loras || loop_idx < 0) {
+            return { nullptr, 1.0f };
+        }
+        for (const auto & lora : *loras) {
+            if (const auto * bridge = lora.first->get_loop_bridge(loop_idx)) {
+                return { bridge, lora.second };
+            }
+        }
+        return { nullptr, 1.0f };
+    };
+
+    ggml_tensor * input_h      = nullptr;
+    ggml_tensor * loop_prev    = nullptr;
+    ggml_tensor * loop_core_in = nullptr;
+
     // MTP/NextN layers are loaded as extra decoder blocks but not executed in the main pass.
     for (int il = 0; il < n_layer; ++il) {
+        const int k       = is_looped ? q35.loop_index[il] : -1;
+        const bool in_rec = (k >= 0);
+        const int step    = in_rec ? (il - (int) q35.n_input) % (int) q35.n_recurrent : -1;
+
+        if (is_looped && il == (int) q35.n_input) {
+            input_h = inpL;
+        }
+        if (in_rec && k >= 1 && step == 0) {
+            loop_prev = inpL;
+            const auto [bridge, b_scale] = find_loop_bridge(k);
+            ggml_tensor * norm_prev = ggml_rms_norm(ctx0, loop_prev, norm_rms_eps);
+            if (bridge && bridge->in_scale) {
+                norm_prev = ggml_mul(ctx0, norm_prev, f32(bridge->in_scale));
+            } else {
+                norm_prev = ggml_scale(ctx0, norm_prev, 0.5f);
+            }
+            ggml_tensor * core_in = ggml_add(ctx0, input_h, norm_prev);
+            if (bridge && bridge->embd) {
+                ggml_tensor * embd = f32(bridge->embd);
+                if (b_scale != 1.0f) {
+                    embd = ggml_scale(ctx0, embd, b_scale);
+                }
+                core_in = ggml_add(ctx0, core_in, embd);
+            }
+            loop_core_in = core_in;
+            inpL         = core_in;
+            cb(inpL, "loop_in", il);
+        }
+
+        this->cur_loop = k;
+
         res->t_layer_inp[il] = inpL;
 
         ggml_tensor * inpSA = inpL;
@@ -178,6 +363,12 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         if (il == n_layer - 1 && crop_before_nextn(inp_out_ids)) {
             cur   = ggml_get_rows(ctx0, cur,   inp_out_ids);
             inpSA = ggml_get_rows(ctx0, inpSA, inp_out_ids);
+            if (loop_prev) {
+                loop_prev = ggml_get_rows(ctx0, loop_prev, inp_out_ids);
+            }
+            if (loop_core_in) {
+                loop_core_in = ggml_get_rows(ctx0, loop_core_in, inp_out_ids);
+            }
         }
 
         // Residual connection
@@ -202,9 +393,28 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
         cur = build_cvec(cur, il);
         cb(cur, "l_out", il);
 
+        if (in_rec && k >= 1 && step == (int) q35.n_recurrent - 1) {
+            const auto [bridge, b_scale] = find_loop_bridge(k);
+            ggml_tensor * delta = ggml_sub(ctx0, cur, loop_core_in);
+            if (bridge && bridge->out_gate) {
+                ggml_tensor * gate = ggml_tanh(ctx0, f32(bridge->out_gate));
+                if (b_scale != 1.0f) {
+                    gate = ggml_scale(ctx0, gate, b_scale);
+                }
+                delta = ggml_mul(ctx0, delta, gate);
+            } else if (!bridge && q35.loop_residual_scale != 1.0f) {
+                delta = ggml_scale(ctx0, delta, q35.loop_residual_scale);
+            }
+            cur = ggml_add(ctx0, loop_prev, delta);
+            cb(cur, "loop_out", il);
+            loop_prev    = nullptr;
+            loop_core_in = nullptr;
+        }
+
         // Input for next layer
         inpL = cur;
     }
+    this->cur_loop = -1;
     cur = inpL;
 
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
@@ -327,11 +537,13 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     cb(Vcur, "Vcur", il);
 
     // Attention computation
+    const auto & q35 = static_cast<const llama_model_qwen35 &>(model);
+    const int cache_il = q35.cache_layer.empty() ? il : q35.cache_layer[il];
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
     cur = build_attn(inp,
                 nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, cache_il);
     cb(cur, "attn_pregate", il);
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);

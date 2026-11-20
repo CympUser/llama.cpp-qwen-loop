@@ -154,6 +154,8 @@ struct llama_model_dory : public llama_model_base {
     std::vector<uint32_t> profile;
     std::vector<int> physical;
     std::vector<int> cache_layer;
+    uint32_t n_layer_physical() const override { return n_input + n_recurrent + n_output; }
+    int layer_physical(int il) const override { return physical.at(il); }
     struct scales {
         ggml_tensor * alpha = nullptr;
         ggml_tensor * sqk = nullptr;
@@ -491,6 +493,13 @@ struct llama_model_nanbeige : public llama_model_base {
     int  n_loops = 1;
     int  n_layer_phys = 0;
     bool skip_loop_final_norm = false;
+
+    uint32_t n_layer_physical() const override {
+        return n_layer_phys > 0 ? (uint32_t) n_layer_phys : hparams.n_layer_all;
+    }
+    int layer_physical(int il) const override {
+        return n_layer_phys > 0 ? (il % n_layer_phys) : il;
+    }
 
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
@@ -2402,6 +2411,24 @@ struct llama_model_qwen3next : public llama_model_base {
 
 struct llama_model_qwen35 : public llama_model_base {
     llama_model_qwen35(const struct llama_model_params & params) : llama_model_base(params) {}
+    uint32_t n_layer_phys = 0;
+    uint32_t n_input      = 0;
+    uint32_t n_recurrent  = 0;
+    uint32_t n_output     = 0;
+    uint32_t n_loops      = 1;
+    float    loop_residual_scale = 0.25f;
+    std::string recurrent_kv_cache_mode = "per_loop";
+    std::vector<int> physical;
+    std::vector<int> cache_layer;
+    std::vector<int> loop_index;
+
+    uint32_t n_layer_physical() const override {
+        return n_layer_phys > 0 ? (n_layer_phys + hparams.n_layer_nextn) : hparams.n_layer_all;
+    }
+    int layer_physical(int il) const override {
+        return physical.empty() ? il : physical.at(il);
+    }
+
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
