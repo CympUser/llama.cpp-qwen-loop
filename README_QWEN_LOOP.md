@@ -1,6 +1,15 @@
 # `llama.cpp-qwen-loop` — Recurrent-Loop Inference (`1..16` Loops) for Qwen3.5 / Qwen3.8
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/CympUser/llama.cpp-qwen-loop/blob/qwen35-loop/try_in_colab.ipynb)
+[![Download Windows CUDA Release](https://img.shields.io/badge/Windows_CUDA-1--Click_Release_v1.0.0-blue?logo=windows)](https://github.com/CympUser/llama.cpp-qwen-loop/releases/tag/v1.0.0)
+
 This fork extends [`brianchmielNV/llama.cpp`](https://github.com/brianchmielNV/llama.cpp) (Dory support) with native **recurrent-loop execution** for the hybrid **Qwen3.5 / Qwen3.8** architecture (Gated DeltaNet + Full Attention `3:1`), enabling test-time compute scaling from `1` to `6+` loops using the same quantized weights in VRAM.
+
+## 1-Click Quickstart (Windows CUDA — No Build Required)
+
+1. Download **`llama-cpp-qwen-loop-v1.0.0-win-cuda-x64.zip`** from [Releases](https://github.com/CympUser/llama.cpp-qwen-loop/releases/tag/v1.0.0) and unzip it.
+2. Double-click **`run.bat`** (automatically downloads the base GGUF and Loop-6 adapter, starts `llama-server.exe`, and opens `http://localhost:8080`).
+3. Switch between **1-Loop, 2-Loop, 4-Loop, and 6-Loop** live inside the Web UI dropdown!
 
 ## What Changed in This Engine
 
